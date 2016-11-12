@@ -23,89 +23,7 @@
 #import <objc/runtime.h>
 #import "UITextView+Placeholder.h"
 
-#pragma mark - `observingKeys`
-
-@interface DWTextViewEventObserver : NSObject
-
-@property (copy, nonatomic) void (^execution)(BOOL fontChanged);
-// can't use weak, because weak before UITextView object dealloc, it will set all weak reference to nil
-// it will make our removeObserver failed to remove.
-@property (unsafe_unretained, nonatomic) UITextView *target;
-
-@end
-
-@implementation DWTextViewEventObserver
-
-+ (void)observe:(UITextView *)target then:(void (^)(BOOL fontChanged))exec {
-    DWTextViewEventObserver *monitor = [[DWTextViewEventObserver alloc] init];
-    monitor.execution = exec;
-    monitor.target = target;
-    [monitor observeEvents];
-    int randomKey;
-    // It is true that swizzle method of dealloc in NSObject Category can do the same thing, but that will cause method polluted!
-    objc_setAssociatedObject(target, &randomKey, monitor, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-#pragma mark - LifeCycle
-+ (NSArray *)observingKeys {
-    return @[@"attributedText",
-             @"bounds",
-             @"font",
-             @"frame",
-             @"text",
-             @"textAlignment",
-             @"textContainerInset"];
-}
-
-- (void)dealloc {
-    [self releaseObserveKeys];
-}
-
-- (void)observeEvents {
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(updatePlaceholderLabel)
-                                                 name:UITextViewTextDidChangeNotification
-                                               object:self.target];
-    
-    for (NSString *key in self.class.observingKeys) {
-        [self.target addObserver:self forKeyPath:key options:NSKeyValueObservingOptionNew context:nil];
-    }
-}
-
-- (void)updatePlaceholderLabel {
-    if (self.execution) {
-        self.execution(NO);
-    }
-}
-
-- (void)observeValueForKeyPath:(NSString *)keyPath
-                      ofObject:(id)object
-                        change:(NSDictionary *)change
-                       context:(void *)context
-{
-    if (self.execution) {
-        BOOL updateFont = [keyPath isEqualToString:@"font"] && change[NSKeyValueChangeNewKey] != nil;
-        self.execution(updateFont);
-    }
-}
-
-- (void)releaseObserveKeys {
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
-    for (NSString *key in self.class.observingKeys) {
-        @try {
-            [self.target removeObserver:self forKeyPath:key context:nil];
-        }
-        @catch (NSException *exception) {
-            // Do nothing
-        }
-    }
-}
-
-@end
-
 @implementation UITextView (Placeholder)
-
-#pragma mark - Swizzle Dealloc
 
 #pragma mark - Class Methods
 #pragma mark `defaultPlaceholderColor`
@@ -121,7 +39,29 @@
     return color;
 }
 
-#pragma mark - Properties
+#pragma mark - UI Life cycle
+// I know below iOS10, UITextView not override willMoveToSuperview and willMoveToWindow,
+// but I am not sure father version still follow this rule.
+- (void)willMoveToSuperview:(UIView *)newSuperview {
+    if (newSuperview == nil) {
+        [self removeRegisterEvents];
+    }
+    else {
+        [self registerEvents];
+    }
+}
+
+- (void)willMoveToWindow:(UIWindow *)newWindow {
+    if (newWindow == nil) {
+        [self removeRegisterEvents];
+    }
+    else {
+        [self registerEvents];
+    }
+}
+
+#pragma mark - Properties:
+#pragma mark -
 #pragma mark `placeholderLabel`
 
 - (UILabel *)placeholderLabel {
@@ -130,24 +70,17 @@
         NSAttributedString *originalText = self.attributedText;
         self.text = @" "; // lazily set font of `UITextView`.
         self.attributedText = originalText;
-
+        
         label = [[UILabel alloc] init];
         label.textColor = [self.class defaultPlaceholderColor];
         label.numberOfLines = 0;
         label.userInteractionEnabled = NO;
         objc_setAssociatedObject(self, @selector(placeholderLabel), label, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
+        
         self.needsUpdateFont = YES;
         [self updatePlaceholderLabel];
         self.needsUpdateFont = NO;
-
-        __weak typeof(self) weakSelf = self;
-        [DWTextViewEventObserver observe:self then:^(BOOL fontChanged) {
-            if (fontChanged) {
-                weakSelf.needsUpdateFont = fontChanged;
-            }
-            [weakSelf updatePlaceholderLabel];
-        }];
+        [self registerEvents];
     }
     return label;
 }
@@ -183,6 +116,7 @@
     self.placeholderLabel.textColor = placeholderColor;
 }
 
+
 #pragma mark `needsUpdateFont`
 
 - (BOOL)needsUpdateFont {
@@ -194,26 +128,96 @@
 }
 
 
+#pragma mark - Events
++ (NSArray *)observingKeys {
+    return @[@"attributedText",
+             @"bounds",
+             @"font",
+             @"frame",
+             @"text",
+             @"textAlignment",
+             @"textContainerInset"];
+}
+
+- (BOOL)registerEvent {
+    return [objc_getAssociatedObject(self, @selector(registerEvent)) boolValue];
+}
+
+- (void)setRegisterEvent:(BOOL)enable {
+    objc_setAssociatedObject(self, @selector(registerEvent), @(enable), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+- (void)removeRegisterEvents {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    UILabel *label = objc_getAssociatedObject(self, @selector(placeholderLabel));
+    if (label && self.registerEvent) {
+        for (NSString *key in self.class.observingKeys) {
+            NSLog(@"removing key:%@", key);
+            @try {
+                [self removeObserver:self forKeyPath:key];
+            }
+            @catch (NSException *exception) {
+#ifdef DEBUG
+                NSLog(@"removeObserver exception:%@", exception);
+#endif
+            }
+        }
+        // remove label, make sure it will recreate if adding to other valid superview.
+        objc_setAssociatedObject(self, @selector(placeholderLabel), nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+- (void)registerEvents {
+    // only register events when the place holder created
+    UILabel *label = objc_getAssociatedObject(self, @selector(placeholderLabel));
+    if (label && !self.registerEvent) {
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(updatePlaceholderLabelFromNotification)
+                                                     name:UITextViewTextDidChangeNotification
+                                                   object:self];
+        
+        for (NSString *key in self.class.observingKeys) {
+            [self addObserver:self forKeyPath:key options:NSKeyValueObservingOptionNew context:nil];
+        }
+        self.registerEvent = YES;
+    }
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath
+                      ofObject:(id)object
+                        change:(NSDictionary *)change
+                       context:(void *)context {
+    if ([keyPath isEqualToString:@"font"]) {
+        self.needsUpdateFont = (change[NSKeyValueChangeNewKey] != nil);
+    }
+    [self updatePlaceholderLabel];
+}
+
+
+- (void)updatePlaceholderLabelFromNotification {
+    NSLog(@"updatePlaceholderLabelFromNotification");
+    [self updatePlaceholderLabel];
+}
+
 #pragma mark - Update
 - (void)updatePlaceholderLabel {
     if (self.text.length) {
         [self.placeholderLabel removeFromSuperview];
         return;
     }
-
+    
     [self insertSubview:self.placeholderLabel atIndex:0];
-
+    
     if (self.needsUpdateFont) {
         self.placeholderLabel.font = self.font;
         self.needsUpdateFont = NO;
     }
-
     self.placeholderLabel.textAlignment = self.textAlignment;
-
+    
     // `NSTextContainer` is available since iOS 7
     CGFloat lineFragmentPadding;
     UIEdgeInsets textContainerInset;
-
+    
 #pragma deploymate push "ignored-api-availability"
     // iOS 7+
     if (NSFoundationVersionNumber > NSFoundationVersionNumber_iOS_6_1) {
@@ -221,13 +225,13 @@
         textContainerInset = self.textContainerInset;
     }
 #pragma deploymate pop
-
+    
     // iOS 6
     else {
         lineFragmentPadding = 5;
         textContainerInset = UIEdgeInsetsMake(8, 0, 8, 0);
     }
-
+    
     CGFloat x = lineFragmentPadding + textContainerInset.left;
     CGFloat y = textContainerInset.top;
     CGFloat width = CGRectGetWidth(self.bounds) - x - lineFragmentPadding - textContainerInset.right;
